@@ -123,30 +123,31 @@ struct PlayerView: View {
         .animation(.spring(duration: 0.45, bounce: 0.25), value: vm.isPlaying)
         .contentShape(Rectangle())
         .gesture(
-            DragGesture(minimumDistance: 10, coordinateSpace: .local)
+            DragGesture(minimumDistance: 8)
                 .onChanged { value in
                     let w = value.translation.width
                     let h = value.translation.height
-                    if abs(w) > abs(h) {
+                    // Show visual feedback as long as horizontal is the dominant axis
+                    if abs(w) > abs(h) * 0.5 {
                         swipeOffset = w * 0.55
                     }
                 }
                 .onEnded { value in
                     let w = value.translation.width
                     let h = value.translation.height
-                    // Si el movimiento es más vertical que horizontal, cancelar
-                    guard abs(w) > abs(h) else {
+                    // Cancel if clearly more vertical than horizontal
+                    guard abs(w) >= 40, abs(w) > abs(h) * 0.5 else {
                         withAnimation(.spring(duration: 0.3, bounce: 0.3)) { swipeOffset = 0 }
                         return
                     }
-                    if w < -70 {
+                    if w < -50 {
                         withAnimation(.easeIn(duration: 0.18)) { swipeOffset = -350 }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
                             vm.playNext()
                             swipeOffset = 350
                             withAnimation(.spring(duration: 0.38, bounce: 0.25)) { swipeOffset = 0 }
                         }
-                    } else if w > 70 {
+                    } else if w > 50 {
                         withAnimation(.easeIn(duration: 0.18)) { swipeOffset = 350 }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
                             vm.playPrevious()

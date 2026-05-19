@@ -12,11 +12,7 @@ final class AudioPlayerService {
     var currentTrack: Track?
 
     var playbackRate: Float = 1.0 {
-        didSet {
-            timePitchNode.rate   = playbackRate
-            // Bypass the pitch node when not needed — saves CPU in background
-            timePitchNode.bypass = (playbackRate == 1.0)
-        }
+        didSet { timePitchNode.rate = playbackRate }
     }
 
     var isCrossfadeEnabled  = false
@@ -28,8 +24,6 @@ final class AudioPlayerService {
             for (i, g) in eqGains.enumerated() where i < eqNode.bands.count {
                 eqNode.bands[i].gain = g
             }
-            // Bypass when flat — saves CPU in background
-            eqNode.bypass = eqGains.allSatisfy { $0 == 0 }
         }
     }
     static let eqFrequencies: [Float]   = [60, 250, 1000, 4000, 16000]
@@ -41,18 +35,22 @@ final class AudioPlayerService {
     var onPreviousRequested: (() -> Void)?
     var onCrossfadeNeeded:   (() -> Void)?
 
-    // MARK: - Engine
-    //   playerNode → eqNode → timePitchNode → mainMixerNode → outputNode
+    // MARK: - Engine  playerNode → eqNode → timePitchNode → mainMixerNode
     private let engine        = AVAudioEngine()
     private let playerNode    = AVAudioPlayerNode()
     private let eqNode        = AVAudioUnitEQ(numberOfBands: 5)
     private let timePitchNode = AVAudioUnitTimePitch()
 
-    private var currentAudioFile: AVAudioFile?
-    private var seekTime: TimeInterval = 0
+    private var currentFile: AVAudioFile?
+    private var seekOffset:  TimeInterval = 0   // time base when the current buffer chain started
 
-    // Incremented on every play/seek — stale completion handlers are ignored
-    private var playbackGeneration = 0
+    // Incremented on every play/seek — old completion callbacks drop themselves
+    private var generation = 0
+
+    // Buffer pipeline: schedule N overlapping 2-second chunks so background
+    // rendering never starves even if the main queue is briefly busy.
+    private let preloadCount  = 3
+    private let bufferFrames: AVAudioFrameCount = 88_200  // ≈ 2 s at 44.1 kHz
 
     private var progressTimer:     Timer?
     private var crossfadeTriggered = false
@@ -61,8 +59,7 @@ final class AudioPlayerService {
     // MARK: - Init / Deinit
 
     init() {
-        // Audio session MUST be configured before the engine starts
-        setupAudioSession()
+        setupAudioSession()   // session must be active BEFORE engine starts
         setupEngine()
         setupRemoteCommands()
         setupNotifications()
@@ -79,22 +76,16 @@ final class AudioPlayerService {
         engine.attach(playerNode)
         engine.attach(eqNode)
         engine.attach(timePitchNode)
-
         connectNodes()
         configureEQBands()
-
         timePitchNode.rate    = 1.0
         timePitchNode.pitch   = 0
         timePitchNode.overlap = 4.0
-        timePitchNode.bypass  = true   // bypassed at 1x — enabled when rate changes
-
-        eqNode.bypass = true           // bypassed when flat — enabled when gains change
-
         startEngine()
     }
 
-    /// Connect the linear processing chain. Called both at setup and after
-    /// AVAudioEngineConfigurationChange (which resets all node connections).
+    /// Separated so it can be called after AVAudioEngineConfigurationChange
+    /// resets all connections.
     private func connectNodes() {
         engine.connect(playerNode,    to: eqNode,               format: nil)
         engine.connect(eqNode,        to: timePitchNode,        format: nil)
@@ -114,44 +105,17 @@ final class AudioPlayerService {
 
     private func startEngine() {
         guard !engine.isRunning else { return }
-        do { try engine.start() } catch {
-            print("[AudioPlayerService] Engine start error: \(error)")
-        }
+        do { try engine.start() }
+        catch { print("[Audio] Engine start: \(error)") }
     }
 
-    /// Called when AVAudioEngineConfigurationChange fires (Bluetooth, screen lock
-    /// route changes, etc.). iOS resets node connections — we must reconnect them,
-    /// restart the engine and reschedule from the current position.
-    private func handleEngineConfigurationChange() {
+    /// Full restart: reconnect nodes (iOS may have reset them), restart engine,
+    /// then resume the buffer chain from the current playback position.
+    private func restartAndResume() {
         connectNodes()
         startEngine()
-        if isPlaying { rescheduleFromCurrentTime() }
-    }
-
-    /// Reschedule the current file from `currentTime`.
-    /// Used after engine resets so playback continues seamlessly.
-    private func rescheduleFromCurrentTime() {
-        guard let file = currentAudioFile else { return }
-        let resumeTime  = currentTime
-        let sr          = file.processingFormat.sampleRate
-        guard sr > 0 else { return }
-        let startFrame  = AVAudioFramePosition(resumeTime * sr)
-        let totalFrames = file.length
-        guard startFrame < totalFrames else { return }
-        let remaining   = AVAudioFrameCount(totalFrames - startFrame)
-        seekTime        = resumeTime
-        playbackGeneration += 1
-        let gen         = playbackGeneration
-
-        playerNode.scheduleSegment(file, startingFrame: startFrame,
-                                   frameCount: remaining, at: nil) { [weak self] in
-            DispatchQueue.main.async {
-                guard let self, self.playbackGeneration == gen else { return }
-                self.isPlaying = false
-                self.stopTimer()
-                self.onTrackFinished?()
-            }
-        }
+        guard isPlaying, let file = currentFile else { return }
+        beginBufferChain(file: file, from: currentTime)
         playerNode.play()
     }
 
@@ -162,46 +126,38 @@ final class AudioPlayerService {
             let s = AVAudioSession.sharedInstance()
             try s.setCategory(.playback, mode: .default, options: [])
             try s.setActive(true)
-        } catch {
-            print("[AudioPlayerService] Session error: \(error)")
-        }
+        } catch { print("[Audio] Session: \(error)") }
     }
 
     private func activateSession() {
-        do {
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch {
-            print("[AudioPlayerService] Activate session error: \(error)")
-        }
+        try? AVAudioSession.sharedInstance().setActive(true)
         startEngine()
     }
 
     // MARK: - Notifications
 
     private func setupNotifications() {
-        let session = AVAudioSession.sharedInstance()
+        let s = AVAudioSession.sharedInstance()
 
         let t1 = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification, object: session, queue: .main
+            forName: AVAudioSession.interruptionNotification, object: s, queue: .main
         ) { [weak self] n in self?.handleInterruption(n) }
 
         let t2 = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.routeChangeNotification, object: session, queue: .main
+            forName: AVAudioSession.routeChangeNotification, object: s, queue: .main
         ) { [weak self] n in self?.handleRouteChange(n) }
 
-        // When hardware config changes (Bluetooth, screen lock audio route), iOS
-        // disconnects all engine nodes — reconnect them and resume from current position.
+        // When iOS reconfigures audio (Bluetooth, screen lock route change…)
+        // it disconnects all engine nodes — reconnect + resume.
         let t3 = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-        ) { [weak self] _ in
-            self?.handleEngineConfigurationChange()
-        }
+        ) { [weak self] _ in self?.restartAndResume() }
 
         notificationTokens = [t1, t2, t3]
     }
 
-    private func handleInterruption(_ note: Notification) {
-        guard let val  = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+    private func handleInterruption(_ n: Notification) {
+        guard let val  = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: val) else { return }
         switch type {
         case .began:
@@ -209,68 +165,95 @@ final class AudioPlayerService {
         case .ended:
             activateSession()
             let opts = AVAudioSession.InterruptionOptions(
-                rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+                rawValue: n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
             if opts.contains(.shouldResume) { resume() }
         @unknown default: break
         }
     }
 
-    private func handleRouteChange(_ note: Notification) {
-        guard let val    = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+    private func handleRouteChange(_ n: Notification) {
+        guard let val    = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason = AVAudioSession.RouteChangeReason(rawValue: val) else { return }
         if reason == .oldDeviceUnavailable { pause() }   // headphones unplugged
+    }
+
+    // MARK: - Buffer pipeline
+    //
+    // Instead of scheduleFile (one-shot, fragile in background), we schedule
+    // short PCM buffers in a self-replenishing chain.  Each buffer's completion
+    // handler queues the next one on the main thread before the audio clock
+    // needs it, giving the engine a 4-6 second look-ahead.
+
+    private func beginBufferChain(file: AVAudioFile, from time: TimeInterval) {
+        let sr = file.processingFormat.sampleRate
+        file.framePosition = AVAudioFramePosition(max(0, time * sr))
+        seekOffset = time
+        let gen = generation
+        for _ in 0..<preloadCount { pumpBuffer(file: file, gen: gen) }
+    }
+
+    private func pumpBuffer(file: AVAudioFile, gen: Int) {
+        guard gen == generation else { return }
+
+        guard let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                          frameCapacity: bufferFrames) else { return }
+        do { try file.read(into: buf) } catch { return }
+
+        if buf.frameLength == 0 {
+            // Reached end of file
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == gen else { return }
+                self.isPlaying = false
+                self.stopTimer()
+                self.onTrackFinished?()
+            }
+            return
+        }
+
+        playerNode.scheduleBuffer(buf, completionCallbackType: .dataConsumed) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.pumpBuffer(file: file, gen: gen)
+            }
+        }
     }
 
     // MARK: - Playback
 
     func play(track: Track) {
         playerNode.stop()
-        playbackGeneration += 1
-        let gen            = playbackGeneration
+        generation        += 1
         currentTime        = 0
-        seekTime           = 0
         crossfadeTriggered = false
 
         do {
             let file = try AVAudioFile(forReading: track.url)
-            currentAudioFile = file
-            let sr   = file.processingFormat.sampleRate
-            duration = sr > 0 ? Double(file.length) / sr : 0
+            currentFile  = file
+            let sr       = file.processingFormat.sampleRate
+            duration     = sr > 0 ? Double(file.length) / sr : 0
             currentTrack = track
 
             activateSession()
-            timePitchNode.rate   = playbackRate
-            timePitchNode.bypass = (playbackRate == 1.0)
+            timePitchNode.rate = playbackRate
 
-            playerNode.scheduleFile(file, at: nil) { [weak self] in
-                DispatchQueue.main.async {
-                    guard let self, self.playbackGeneration == gen else { return }
-                    self.isPlaying = false
-                    self.stopTimer()
-                    self.onTrackFinished?()
-                }
-            }
-
+            beginBufferChain(file: file, from: 0)
             playerNode.play()
             isPlaying = true
             startTimer()
             updateNowPlaying()
         } catch {
-            print("[AudioPlayerService] Play error: \(error)")
+            print("[Audio] Play error: \(error)")
         }
     }
 
-    /// Crossfade: fade out current track volume, then start next track
     func startCrossfadeTo(track: Track) {
-        let fadeSteps    = 20
-        let stepInterval = crossfadeDuration / Double(fadeSteps)
-        var step         = 0
-
-        Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { [weak self] t in
+        let steps    = 20
+        let interval = crossfadeDuration / Double(steps)
+        var step     = 0
+        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
             step += 1
-            playerNode.volume = max(0, 1.0 - Float(step) / Float(fadeSteps))
-            if step >= fadeSteps {
+            playerNode.volume = max(0, 1.0 - Float(step) / Float(steps))
+            if step >= steps {
                 t.invalidate()
                 self.playerNode.volume = 1.0
                 self.play(track: track)
@@ -287,7 +270,7 @@ final class AudioPlayerService {
     }
 
     func resume() {
-        guard !isPlaying, currentAudioFile != nil else { return }
+        guard !isPlaying, currentFile != nil else { return }
         activateSession()
         playerNode.play()
         isPlaying = true
@@ -298,31 +281,14 @@ final class AudioPlayerService {
     func togglePlayPause() { isPlaying ? pause() : resume() }
 
     func seek(to time: TimeInterval) {
-        guard let file = currentAudioFile else { return }
+        guard let file = currentFile else { return }
         let wasPlaying = isPlaying
         playerNode.stop()
-        playbackGeneration += 1
-        let gen = playbackGeneration
-
-        let sr          = file.processingFormat.sampleRate
-        let startFrame  = AVAudioFramePosition(time * sr)
-        let totalFrames = file.length
-        guard startFrame < totalFrames else { return }
-
-        let remaining = AVAudioFrameCount(totalFrames - startFrame)
-        seekTime    = time
-        currentTime = time
+        generation        += 1
+        currentTime        = time
         crossfadeTriggered = false
 
-        playerNode.scheduleSegment(file, startingFrame: startFrame,
-                                   frameCount: remaining, at: nil) { [weak self] in
-            DispatchQueue.main.async {
-                guard let self, self.playbackGeneration == gen else { return }
-                self.isPlaying = false
-                self.stopTimer()
-                self.onTrackFinished?()
-            }
-        }
+        beginBufferChain(file: file, from: time)
 
         if wasPlaying {
             activateSession()
@@ -338,31 +304,29 @@ final class AudioPlayerService {
     private func startTimer() {
         stopTimer()
         let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self, isPlaying else { return }
+            guard let self, self.isPlaying else { return }
 
-            // Safety net: if engine died silently in background, restart and reschedule
-            if !engine.isRunning {
-                handleEngineConfigurationChange()
+            // Safety net: if the engine died silently in background, revive it
+            if !self.engine.isRunning {
+                self.restartAndResume()
                 return
             }
 
-            if let nodeTime   = playerNode.lastRenderTime,
-               let playerTime = playerNode.playerTime(forNodeTime: nodeTime),
-               playerTime.sampleRate > 0,
-               playerTime.sampleTime >= 0 {
-                let computed = Double(playerTime.sampleTime) / playerTime.sampleRate + seekTime
-                currentTime  = duration > 0 ? min(computed, duration) : computed
+            // Playback position = engine sample position + seek base
+            if let nodeTime   = self.playerNode.lastRenderTime,
+               let playerTime = self.playerNode.playerTime(forNodeTime: nodeTime),
+               playerTime.sampleRate > 0, playerTime.sampleTime >= 0 {
+                let pos          = Double(playerTime.sampleTime) / playerTime.sampleRate + self.seekOffset
+                self.currentTime = self.duration > 0 ? min(pos, self.duration) : pos
             }
 
-            // Keep lock screen progress bar moving
-            updateNowPlaying()
+            self.updateNowPlaying()
 
-            // Crossfade trigger
-            if isCrossfadeEnabled && !crossfadeTriggered && duration > 0 {
-                let remaining = duration - currentTime
-                if remaining <= crossfadeDuration && remaining > 0 {
-                    crossfadeTriggered = true
-                    onCrossfadeNeeded?()
+            if self.isCrossfadeEnabled && !self.crossfadeTriggered && self.duration > 0 {
+                let left = self.duration - self.currentTime
+                if left <= self.crossfadeDuration && left > 0 {
+                    self.crossfadeTriggered = true
+                    self.onCrossfadeNeeded?()
                 }
             }
         }
@@ -375,7 +339,7 @@ final class AudioPlayerService {
         progressTimer = nil
     }
 
-    // MARK: - Now Playing Info
+    // MARK: - Now Playing
 
     private func updateNowPlaying() {
         guard let track = currentTrack else { return }
