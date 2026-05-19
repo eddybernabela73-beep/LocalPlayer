@@ -45,6 +45,10 @@ final class AudioPlayerService {
     private var currentAudioFile: AVAudioFile?
     private var seekTime: TimeInterval = 0
 
+    // Generation counter — incremented on every play/seek so stale completion
+    // handlers (fired by playerNode.stop()) are silently ignored.
+    private var playbackGeneration = 0
+
     private var progressTimer:     Timer?
     private var crossfadeTriggered = false
     private var notificationTokens: [Any] = []
@@ -170,6 +174,8 @@ final class AudioPlayerService {
 
     func play(track: Track) {
         playerNode.stop()
+        playbackGeneration += 1
+        let gen            = playbackGeneration
         currentTime        = 0
         seekTime           = 0
         crossfadeTriggered = false
@@ -186,7 +192,8 @@ final class AudioPlayerService {
 
             playerNode.scheduleFile(file, at: nil) { [weak self] in
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    // Ignore if a newer play/seek has already started
+                    guard let self, self.playbackGeneration == gen else { return }
                     self.isPlaying = false
                     self.stopTimer()
                     self.onTrackFinished?()
@@ -244,6 +251,8 @@ final class AudioPlayerService {
         guard let file = currentAudioFile else { return }
         let wasPlaying = isPlaying
         playerNode.stop()
+        playbackGeneration += 1
+        let gen = playbackGeneration
 
         let sr          = file.processingFormat.sampleRate
         let startFrame  = AVAudioFramePosition(time * sr)
@@ -257,7 +266,7 @@ final class AudioPlayerService {
 
         playerNode.scheduleSegment(file, startingFrame: startFrame, frameCount: remaining, at: nil) { [weak self] in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.playbackGeneration == gen else { return }
                 self.isPlaying = false
                 self.stopTimer()
                 self.onTrackFinished?()
