@@ -1,0 +1,18 @@
+# Proyecto generado por XcodeGen (no commitear)
+*.xcodeproj/
+*.xcworkspace/
+
+# Build outputs
+build/
+DerivedData/
+.build/
+
+# macOS
+.DS_Store
+
+# Xcode
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.pbxuser
+xcuserdata/

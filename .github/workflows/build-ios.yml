@@ -1,0 +1,67 @@
+name: Build LocalPlayer IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # permite ejecutar manualmente desde la web de GitHub
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build app (unsigned, sin firma)
+        run: |
+          set -eo pipefail
+          xcodebuild \
+            -project LocalPlayer.xcodeproj \
+            -scheme LocalPlayer \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO \
+            build \
+            -derivedDataPath build/DerivedData
+
+      - name: Crear IPA desde .app
+        run: |
+          # Buscar el .app compilado
+          APP=$(find build/DerivedData -name "LocalPlayer.app" | head -1)
+
+          if [ -z "$APP" ]; then
+            echo "❌ ERROR: LocalPlayer.app no encontrado"
+            find build/DerivedData -name "*.app" 2>/dev/null || echo "No se encontraron .app"
+            exit 1
+          fi
+
+          echo "✅ App encontrada: $APP"
+
+          # Crear estructura de IPA
+          mkdir -p build/Payload
+          cp -r "$APP" build/Payload/LocalPlayer.app
+          cd build && zip -r LocalPlayer.ipa Payload
+
+          echo "✅ IPA creado: $(du -sh LocalPlayer.ipa | cut -f1)"
+
+      - name: Subir IPA como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalPlayer-IPA
+          path: build/LocalPlayer.ipa
+          retention-days: 30
+          if-no-files-found: error
