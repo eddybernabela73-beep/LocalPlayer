@@ -7,6 +7,8 @@ struct PlayerView: View {
     @State private var isDragging = false
     @State private var dragProgress: Double = 0
     @State private var showSleepSheet = false
+    @State private var swipeOffset: CGFloat = 0
+    @State private var isSwiping = false
 
     var body: some View {
         @Bindable var vm = vm
@@ -115,7 +117,53 @@ struct PlayerView: View {
         }
         .shadow(color: .black.opacity(0.55), radius: 35, y: 18)
         .scaleEffect(vm.isPlaying ? 1.0 : 0.87)
+        .offset(x: swipeOffset)
+        .rotationEffect(.degrees(swipeOffset / 20))
         .animation(.spring(duration: 0.45, bounce: 0.25), value: vm.isPlaying)
+        .gesture(
+            DragGesture(minimumDistance: 20)
+                .onChanged { value in
+                    // Solo responder a gestos horizontales
+                    guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                    isSwiping = true
+                    swipeOffset = value.translation.width * 0.6
+                }
+                .onEnded { value in
+                    guard isSwiping else { return }
+                    let threshold: CGFloat = 80
+                    if value.translation.width < -threshold {
+                        // Swipe izquierda → siguiente
+                        withAnimation(.easeIn(duration: 0.2)) {
+                            swipeOffset = -400
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                            vm.playNext()
+                            swipeOffset = 400
+                            withAnimation(.spring(duration: 0.35, bounce: 0.2)) {
+                                swipeOffset = 0
+                            }
+                        }
+                    } else if value.translation.width > threshold {
+                        // Swipe derecha → anterior
+                        withAnimation(.easeIn(duration: 0.2)) {
+                            swipeOffset = 400
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                            vm.playPrevious()
+                            swipeOffset = -400
+                            withAnimation(.spring(duration: 0.35, bounce: 0.2)) {
+                                swipeOffset = 0
+                            }
+                        }
+                    } else {
+                        // No llegó al umbral → volver al centro
+                        withAnimation(.spring(duration: 0.35, bounce: 0.3)) {
+                            swipeOffset = 0
+                        }
+                    }
+                    isSwiping = false
+                }
+        )
     }
 
     // MARK: - Track Info
