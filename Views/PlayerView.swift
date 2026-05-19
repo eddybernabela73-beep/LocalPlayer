@@ -7,6 +7,8 @@ struct PlayerView: View {
     @State private var isDragging = false
     @State private var dragProgress: Double = 0
     @State private var showSleepSheet = false
+    @State private var showEQSheet = false
+    @State private var showLyricsSheet = false
     @State private var swipeOffset: CGFloat = 0
 
     var body: some View {
@@ -62,9 +64,9 @@ struct PlayerView: View {
             }
         }
         .ignoresSafeArea()
-        .sheet(isPresented: $showSleepSheet) {
-            sleepTimerSheet
-        }
+        .sheet(isPresented: $showSleepSheet)   { sleepTimerSheet }
+        .sheet(isPresented: $showEQSheet)      { EqualizerView().environment(vm) }
+        .sheet(isPresented: $showLyricsSheet)  { LyricsView().environment(vm) }
     }
 
     // MARK: - Background
@@ -291,60 +293,45 @@ struct PlayerView: View {
         }
     }
 
-    // MARK: - Extra Controls (Speed + Crossfade + Sleep Timer)
+    // MARK: - Extra Controls (Speed + Crossfade + Sleep + EQ + Lyrics)
 
     private var extraControls: some View {
-        HStack(spacing: 0) {
-
-            // Speed button
-            Button(action: vm.cycleSpeed) {
-                VStack(spacing: 4) {
-                    Image(systemName: "gauge.with.dots.needle.67percent")
-                        .font(.system(size: 16))
-                        .foregroundStyle(.white.opacity(0.7))
-                    Text(vm.speedLabel)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.55))
-                        .monospacedDigit()
-                }
+        VStack(spacing: 10) {
+            HStack(spacing: 0) {
+                extraButton(icon: "gauge.with.dots.needle.67percent", label: vm.speedLabel,
+                            active: vm.playbackSpeed != 1.0) { vm.cycleSpeed() }
+                extraButton(icon: "arrow.trianglehead.2.clockwise.rotate.90", label: "Crossfade",
+                            active: vm.isCrossfadeEnabled) { vm.isCrossfadeEnabled.toggle() }
+                extraButton(icon: "moon.zzz", label: vm.sleepTimerActive ? vm.sleepTimerLabel : "Sleep",
+                            active: vm.sleepTimerActive) { showSleepSheet = true }
             }
-            .frame(maxWidth: .infinity)
-
-            // Crossfade toggle
-            Button {
-                vm.isCrossfadeEnabled.toggle()
-            } label: {
-                VStack(spacing: 4) {
-                    Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
-                        .font(.system(size: 16))
-                        .foregroundStyle(vm.isCrossfadeEnabled ? .white : .white.opacity(0.35))
-                    Text("Crossfade")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(vm.isCrossfadeEnabled ? .white.opacity(0.8) : .white.opacity(0.35))
-                }
+            HStack(spacing: 0) {
+                extraButton(icon: "slider.vertical.3", label: "Ecualizador",
+                            active: vm.eqGains.contains(where: { $0 != 0 })) { showEQSheet = true }
+                extraButton(icon: "text.quote", label: "Letra",
+                            active: !vm.lyrics.isEmpty) { showLyricsSheet = true }
             }
-            .frame(maxWidth: .infinity)
-
-            // Sleep timer
-            Button {
-                showSleepSheet = true
-            } label: {
-                VStack(spacing: 4) {
-                    Image(systemName: "moon.zzz")
-                        .font(.system(size: 16))
-                        .foregroundStyle(vm.sleepTimerActive ? .white : .white.opacity(0.35))
-                    Text(vm.sleepTimerActive ? vm.sleepTimerLabel : "Sleep")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(vm.sleepTimerActive ? .white.opacity(0.8) : .white.opacity(0.35))
-                        .monospacedDigit()
-                }
-            }
-            .frame(maxWidth: .infinity)
         }
         .padding(.vertical, 10)
         .padding(.horizontal, 14)
         .background(.white.opacity(0.08))
         .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func extraButton(icon: String, label: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                    .foregroundStyle(active ? .white : .white.opacity(0.35))
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(active ? .white.opacity(0.85) : .white.opacity(0.35))
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Sleep Timer Sheet
