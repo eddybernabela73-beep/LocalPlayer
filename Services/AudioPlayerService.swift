@@ -12,7 +12,11 @@ final class AudioPlayerService {
     var currentTrack: Track?
 
     var playbackRate: Float = 1.0 {
-        didSet { timePitchNode.rate = playbackRate }
+        didSet {
+            timePitchNode.rate   = playbackRate
+            // Bypass the pitch node when not needed — saves CPU in background
+            timePitchNode.bypass = (playbackRate == 1.0)
+        }
     }
 
     var isCrossfadeEnabled  = false
@@ -24,6 +28,8 @@ final class AudioPlayerService {
             for (i, g) in eqGains.enumerated() where i < eqNode.bands.count {
                 eqNode.bands[i].gain = g
             }
+            // Bypass when flat — saves CPU in background
+            eqNode.bypass = eqGains.allSatisfy { $0 == 0 }
         }
     }
     static let eqFrequencies: [Float]   = [60, 250, 1000, 4000, 16000]
@@ -35,7 +41,7 @@ final class AudioPlayerService {
     var onPreviousRequested: (() -> Void)?
     var onCrossfadeNeeded:   (() -> Void)?
 
-    // MARK: - Engine — simple linear graph
+    // MARK: - Engine
     //   playerNode → eqNode → timePitchNode → mainMixerNode → outputNode
     private let engine        = AVAudioEngine()
     private let playerNode    = AVAudioPlayerNode()
@@ -45,8 +51,7 @@ final class AudioPlayerService {
     private var currentAudioFile: AVAudioFile?
     private var seekTime: TimeInterval = 0
 
-    // Generation counter — incremented on every play/seek so stale completion
-    // handlers (fired by playerNode.stop()) are silently ignored.
+    // Incremented on every play/seek — stale completion handlers are ignored
     private var playbackGeneration = 0
 
     private var progressTimer:     Timer?
@@ -56,8 +61,9 @@ final class AudioPlayerService {
     // MARK: - Init / Deinit
 
     init() {
-        setupEngine()
+        // Audio session MUST be configured before the engine starts
         setupAudioSession()
+        setupEngine()
         setupRemoteCommands()
         setupNotifications()
     }
@@ -74,12 +80,28 @@ final class AudioPlayerService {
         engine.attach(eqNode)
         engine.attach(timePitchNode)
 
-        // Linear chain — simplest possible graph for reliable background audio
-        engine.connect(playerNode,    to: eqNode,              format: nil)
-        engine.connect(eqNode,        to: timePitchNode,       format: nil)
-        engine.connect(timePitchNode, to: engine.mainMixerNode, format: nil)
+        connectNodes()
+        configureEQBands()
 
-        // Configure EQ bands
+        timePitchNode.rate    = 1.0
+        timePitchNode.pitch   = 0
+        timePitchNode.overlap = 4.0
+        timePitchNode.bypass  = true   // bypassed at 1x — enabled when rate changes
+
+        eqNode.bypass = true           // bypassed when flat — enabled when gains change
+
+        startEngine()
+    }
+
+    /// Connect the linear processing chain. Called both at setup and after
+    /// AVAudioEngineConfigurationChange (which resets all node connections).
+    private func connectNodes() {
+        engine.connect(playerNode,    to: eqNode,               format: nil)
+        engine.connect(eqNode,        to: timePitchNode,        format: nil)
+        engine.connect(timePitchNode, to: engine.mainMixerNode, format: nil)
+    }
+
+    private func configureEQBands() {
         let freqs: [Float] = [60, 250, 1000, 4000, 16000]
         for (i, f) in freqs.enumerated() {
             eqNode.bands[i].filterType = .parametric
@@ -88,12 +110,6 @@ final class AudioPlayerService {
             eqNode.bands[i].gain       = 0
             eqNode.bands[i].bypass     = false
         }
-
-        timePitchNode.rate    = 1.0
-        timePitchNode.pitch   = 0
-        timePitchNode.overlap = 4.0   // lower CPU than 8
-
-        startEngine()
     }
 
     private func startEngine() {
@@ -103,13 +119,49 @@ final class AudioPlayerService {
         }
     }
 
+    /// Called when AVAudioEngineConfigurationChange fires (Bluetooth, screen lock
+    /// route changes, etc.). iOS resets node connections — we must reconnect them,
+    /// restart the engine and reschedule from the current position.
+    private func handleEngineConfigurationChange() {
+        connectNodes()
+        startEngine()
+        if isPlaying { rescheduleFromCurrentTime() }
+    }
+
+    /// Reschedule the current file from `currentTime`.
+    /// Used after engine resets so playback continues seamlessly.
+    private func rescheduleFromCurrentTime() {
+        guard let file = currentAudioFile else { return }
+        let resumeTime  = currentTime
+        let sr          = file.processingFormat.sampleRate
+        guard sr > 0 else { return }
+        let startFrame  = AVAudioFramePosition(resumeTime * sr)
+        let totalFrames = file.length
+        guard startFrame < totalFrames else { return }
+        let remaining   = AVAudioFrameCount(totalFrames - startFrame)
+        seekTime        = resumeTime
+        playbackGeneration += 1
+        let gen         = playbackGeneration
+
+        playerNode.scheduleSegment(file, startingFrame: startFrame,
+                                   frameCount: remaining, at: nil) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, self.playbackGeneration == gen else { return }
+                self.isPlaying = false
+                self.stopTimer()
+                self.onTrackFinished?()
+            }
+        }
+        playerNode.play()
+    }
+
     // MARK: - Audio Session
 
     private func setupAudioSession() {
         do {
             let s = AVAudioSession.sharedInstance()
             try s.setCategory(.playback, mode: .default, options: [])
-            try s.setActive(true, options: .notifyOthersOnDeactivation)
+            try s.setActive(true)
         } catch {
             print("[AudioPlayerService] Session error: \(error)")
         }
@@ -117,7 +169,7 @@ final class AudioPlayerService {
 
     private func activateSession() {
         do {
-            try AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
+            try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             print("[AudioPlayerService] Activate session error: \(error)")
         }
@@ -137,13 +189,12 @@ final class AudioPlayerService {
             forName: AVAudioSession.routeChangeNotification, object: session, queue: .main
         ) { [weak self] n in self?.handleRouteChange(n) }
 
-        // Restart engine if hardware config changes (Bluetooth connect/disconnect etc.)
+        // When hardware config changes (Bluetooth, screen lock audio route), iOS
+        // disconnects all engine nodes — reconnect them and resume from current position.
         let t3 = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.startEngine()
-            if self.isPlaying { self.playerNode.play() }
+            self?.handleEngineConfigurationChange()
         }
 
         notificationTokens = [t1, t2, t3]
@@ -183,16 +234,16 @@ final class AudioPlayerService {
         do {
             let file = try AVAudioFile(forReading: track.url)
             currentAudioFile = file
-            let sr = file.processingFormat.sampleRate
-            duration     = sr > 0 ? Double(file.length) / sr : 0
+            let sr   = file.processingFormat.sampleRate
+            duration = sr > 0 ? Double(file.length) / sr : 0
             currentTrack = track
 
             activateSession()
-            timePitchNode.rate = playbackRate
+            timePitchNode.rate   = playbackRate
+            timePitchNode.bypass = (playbackRate == 1.0)
 
             playerNode.scheduleFile(file, at: nil) { [weak self] in
                 DispatchQueue.main.async {
-                    // Ignore if a newer play/seek has already started
                     guard let self, self.playbackGeneration == gen else { return }
                     self.isPlaying = false
                     self.stopTimer()
@@ -215,7 +266,6 @@ final class AudioPlayerService {
         let stepInterval = crossfadeDuration / Double(fadeSteps)
         var step         = 0
 
-        // Fade out volume
         Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
             step += 1
@@ -264,7 +314,8 @@ final class AudioPlayerService {
         currentTime = time
         crossfadeTriggered = false
 
-        playerNode.scheduleSegment(file, startingFrame: startFrame, frameCount: remaining, at: nil) { [weak self] in
+        playerNode.scheduleSegment(file, startingFrame: startFrame,
+                                   frameCount: remaining, at: nil) { [weak self] in
             DispatchQueue.main.async {
                 guard let self, self.playbackGeneration == gen else { return }
                 self.isPlaying = false
@@ -289,7 +340,12 @@ final class AudioPlayerService {
         let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self, isPlaying else { return }
 
-            // Get accurate position from player node
+            // Safety net: if engine died silently in background, restart and reschedule
+            if !engine.isRunning {
+                handleEngineConfigurationChange()
+                return
+            }
+
             if let nodeTime   = playerNode.lastRenderTime,
                let playerTime = playerNode.playerTime(forNodeTime: nodeTime),
                playerTime.sampleRate > 0,
@@ -298,7 +354,7 @@ final class AudioPlayerService {
                 currentTime  = duration > 0 ? min(computed, duration) : computed
             }
 
-            // Update Now Playing periodically so lock screen progress bar moves
+            // Keep lock screen progress bar moving
             updateNowPlaying()
 
             // Crossfade trigger
