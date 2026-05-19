@@ -94,6 +94,10 @@ final class AudioPlayerService {
         }
 
         do {
+            // Detach delegate from old player so onTrackFinished doesn't fire
+            // a second time and cause a double-skip
+            oldPlayer.delegate = nil
+
             let nextPlayer = try AVAudioPlayer(contentsOf: track.url)
             nextPlayer.enableRate = true
             nextPlayer.rate = playbackRate
