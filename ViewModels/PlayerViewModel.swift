@@ -1,6 +1,16 @@
 import Foundation
 import AVFoundation
 
+// MARK: - Sort Mode
+
+enum SortMode: String, CaseIterable, Identifiable {
+    case title    = "Título"
+    case artist   = "Artista"
+    case album    = "Álbum"
+    case duration = "Duración"
+    var id: String { rawValue }
+}
+
 // MARK: - Repeat Mode
 
 enum RepeatMode: String {
@@ -34,21 +44,110 @@ final class PlayerViewModel {
     var tracks: [Track] = []
     var isLoading = false
     var folderName = ""
+    var searchText = ""
+    var sortMode: SortMode = .title
+
+    /// Filtered + sorted tracks for display in the library
+    var displayTracks: [Track] {
+        var result = tracks
+        if !searchText.isEmpty {
+            result = result.filter {
+                $0.title.localizedCaseInsensitiveContains(searchText) ||
+                $0.artist.localizedCaseInsensitiveContains(searchText) ||
+                $0.album.localizedCaseInsensitiveContains(searchText)
+            }
+        }
+        switch sortMode {
+        case .title:
+            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .artist:
+            result.sort { $0.artist.localizedCaseInsensitiveCompare($1.artist) == .orderedAscending }
+        case .album:
+            result.sort { $0.album.localizedCaseInsensitiveCompare($1.album) == .orderedAscending }
+        case .duration:
+            result.sort { $0.duration < $1.duration }
+        }
+        return result
+    }
 
     // MARK: - Playback state
     var currentIndex = -1
     var isShuffled = false
     var repeatMode: RepeatMode = .off
 
+    // MARK: - Playback speed
+    static let speedOptions: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+    var playbackSpeed: Float {
+        get { audioService.playbackRate }
+        set { audioService.playbackRate = newValue }
+    }
+
+    var speedLabel: String {
+        let s = playbackSpeed
+        if s == Float(Int(s)) { return "\(Int(s))x" }
+        return String(format: "%.2gx", s)
+    }
+
+    func cycleSpeed() {
+        let options = PlayerViewModel.speedOptions
+        let idx = options.firstIndex(of: playbackSpeed) ?? 2
+        playbackSpeed = options[(idx + 1) % options.count]
+    }
+
+    // MARK: - Crossfade
+    var isCrossfadeEnabled: Bool {
+        get { audioService.isCrossfadeEnabled }
+        set { audioService.isCrossfadeEnabled = newValue }
+    }
+
+    // MARK: - Sleep Timer
+    var sleepTimerActive = false
+    var sleepTimerRemaining: TimeInterval = 0
+    private var sleepTimer: Timer?
+
+    var sleepTimerLabel: String {
+        let total = Int(sleepTimerRemaining)
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
+    }
+
+    func setSleepTimer(minutes: Int) {
+        cancelSleepTimer()
+        guard minutes > 0 else { return }
+        sleepTimerRemaining = TimeInterval(minutes * 60)
+        sleepTimerActive = true
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.sleepTimerRemaining -= 1
+                if self.sleepTimerRemaining <= 0 {
+                    self.audioService.pause()
+                    self.cancelSleepTimer()
+                }
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        sleepTimer = t
+    }
+
+    func cancelSleepTimer() {
+        sleepTimer?.invalidate()
+        sleepTimer = nil
+        sleepTimerActive = false
+        sleepTimerRemaining = 0
+    }
+
     // MARK: - UI state
     var showPlayer = false
     var showFilePicker = false
 
     // MARK: - Forwarded from AudioPlayerService
-    var isPlaying: Bool        { audioService.isPlaying }
+    var isPlaying: Bool           { audioService.isPlaying }
     var currentTime: TimeInterval { audioService.currentTime }
-    var duration: TimeInterval  { audioService.duration }
-    var currentTrack: Track?   { audioService.currentTrack }
+    var duration: TimeInterval    { audioService.duration }
+    var currentTrack: Track?      { audioService.currentTrack }
 
     // MARK: - Private
     private let audioService = AudioPlayerService()
@@ -66,6 +165,9 @@ final class PlayerViewModel {
         }
         audioService.onPreviousRequested = { [weak self] in
             Task { @MainActor in self?.playPrevious() }
+        }
+        audioService.onCrossfadeNeeded = { [weak self] in
+            Task { @MainActor in self?.handleCrossfade() }
         }
         restoreSession()
     }
@@ -117,7 +219,6 @@ final class PlayerViewModel {
         tracks = loaded
         isLoading = false
 
-        // Restore last played track by filename
         if let lastName = defaults.string(forKey: "lastTrackFile") {
             currentIndex = tracks.firstIndex(where: { $0.url.lastPathComponent == lastName }) ?? -1
         }
@@ -125,9 +226,9 @@ final class PlayerViewModel {
 
     private func loadTrackMetadata(url: URL) async -> Track {
         let asset = AVURLAsset(url: url)
-        var title  = url.deletingPathExtension().lastPathComponent
-        var artist = "Desconocido"
-        var album  = ""
+        var title       = url.deletingPathExtension().lastPathComponent
+        var artist      = "Desconocido"
+        var album       = ""
         var artworkData: Data?
         var duration: TimeInterval = 0
 
@@ -175,6 +276,12 @@ final class PlayerViewModel {
         if isShuffled { buildShuffleQueue(excluding: index) }
     }
 
+    /// Play a track by identity (used when list is filtered/sorted)
+    func play(track: Track) {
+        guard let index = tracks.firstIndex(where: { $0.id == track.id }) else { return }
+        play(at: index)
+    }
+
     func togglePlayPause() {
         if currentTrack == nil, !tracks.isEmpty {
             play(at: currentIndex >= 0 ? currentIndex : 0)
@@ -206,6 +313,21 @@ final class PlayerViewModel {
 
     func toggleRepeat() {
         repeatMode = repeatMode.next
+    }
+
+    // MARK: - Crossfade handler
+
+    private func handleCrossfade() {
+        guard !tracks.isEmpty else { return }
+        if repeatMode == .one {
+            audioService.startCrossfadeTo(track: tracks[currentIndex])
+            return
+        }
+        if let next = nextIndex() {
+            currentIndex = next
+            audioService.startCrossfadeTo(track: tracks[next])
+            defaults.set(tracks[next].url.lastPathComponent, forKey: "lastTrackFile")
+        }
     }
 
     // MARK: - Queue Logic

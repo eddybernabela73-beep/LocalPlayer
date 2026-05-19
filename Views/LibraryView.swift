@@ -5,6 +5,8 @@ struct LibraryView: View {
     @Environment(PlayerViewModel.self) private var vm
 
     var body: some View {
+        @Bindable var vm = vm
+
         Group {
             if vm.isLoading {
                 loadingView
@@ -16,7 +18,22 @@ struct LibraryView: View {
         }
         .navigationTitle("Biblioteca")
         .navigationBarTitleDisplayMode(.large)
+        .searchable(text: $vm.searchText, prompt: "Buscar canciones, artistas…")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                if !vm.tracks.isEmpty {
+                    Menu {
+                        Picker("Ordenar por", selection: $vm.sortMode) {
+                            ForEach(SortMode.allCases) { mode in
+                                Label(mode.rawValue, systemImage: sortIcon(mode)).tag(mode)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                            .fontWeight(.semibold)
+                    }
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     vm.showFilePicker = true
@@ -27,16 +44,22 @@ struct LibraryView: View {
             }
         }
         .fileImporter(
-            isPresented: Binding(
-                get: { vm.showFilePicker },
-                set: { vm.showFilePicker = $0 }
-            ),
+            isPresented: $vm.showFilePicker,
             allowedContentTypes: [.folder],
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
                 vm.loadFolder(url: url)
             }
+        }
+    }
+
+    private func sortIcon(_ mode: SortMode) -> String {
+        switch mode {
+        case .title:    return "textformat"
+        case .artist:   return "person"
+        case .album:    return "square.stack"
+        case .duration: return "clock"
         }
     }
 
@@ -90,7 +113,7 @@ struct LibraryView: View {
 
     private var trackListView: some View {
         List {
-            // Folder info
+            // Folder info + sort info
             Section {
                 HStack(spacing: 10) {
                     Image(systemName: "folder.fill")
@@ -98,7 +121,9 @@ struct LibraryView: View {
                     Text(vm.folderName)
                         .font(.subheadline)
                     Spacer()
-                    Text("\(vm.tracks.count) canciones")
+                    Text(vm.searchText.isEmpty
+                         ? "\(vm.tracks.count) canciones"
+                         : "\(vm.displayTracks.count) de \(vm.tracks.count)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -107,18 +132,30 @@ struct LibraryView: View {
 
             // Tracks
             Section {
-                ForEach(Array(vm.tracks.enumerated()), id: \.element.id) { index, track in
-                    TrackRow(
-                        track: track,
-                        isCurrent: vm.currentIndex == index,
-                        isPlaying: vm.currentIndex == index && vm.isPlaying
-                    )
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        vm.play(at: index)
-                        vm.showPlayer = true
+                if vm.displayTracks.isEmpty {
+                    HStack {
+                        Spacer()
+                        Text("Sin resultados para \"\(vm.searchText)\"")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Spacer()
                     }
-                    .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                    .padding(.vertical, 8)
+                } else {
+                    ForEach(vm.displayTracks) { track in
+                        let isCurrent = vm.currentTrack?.id == track.id
+                        TrackRow(
+                            track: track,
+                            isCurrent: isCurrent,
+                            isPlaying: isCurrent && vm.isPlaying
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            vm.play(track: track)
+                            vm.showPlayer = true
+                        }
+                        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                    }
                 }
             }
         }

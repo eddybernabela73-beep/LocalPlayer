@@ -6,8 +6,11 @@ struct PlayerView: View {
 
     @State private var isDragging = false
     @State private var dragProgress: Double = 0
+    @State private var showSleepSheet = false
 
     var body: some View {
+        @Bindable var vm = vm
+
         ZStack {
             background
 
@@ -24,34 +27,43 @@ struct PlayerView: View {
                 artworkSection
                     .padding(.horizontal, 38)
 
-                Spacer().frame(height: 32)
+                Spacer().frame(height: 28)
 
                 // Track title + artist
                 trackInfoSection
                     .padding(.horizontal, 38)
 
-                Spacer().frame(height: 22)
+                Spacer().frame(height: 20)
 
                 // Progress bar
                 progressSection
                     .padding(.horizontal, 38)
 
-                Spacer().frame(height: 26)
+                Spacer().frame(height: 24)
 
                 // Play / Prev / Next
                 mainControls
                     .padding(.horizontal, 38)
 
-                Spacer().frame(height: 22)
+                Spacer().frame(height: 20)
 
                 // Shuffle + Repeat
                 secondaryControls
                     .padding(.horizontal, 52)
 
+                Spacer().frame(height: 18)
+
+                // Speed + Crossfade + Sleep Timer
+                extraControls
+                    .padding(.horizontal, 38)
+
                 Spacer()
             }
         }
         .ignoresSafeArea()
+        .sheet(isPresented: $showSleepSheet) {
+            sleepTimerSheet
+        }
     }
 
     // MARK: - Background
@@ -209,11 +221,10 @@ struct PlayerView: View {
         }
     }
 
-    // MARK: - Secondary Controls
+    // MARK: - Secondary Controls (Shuffle + Repeat)
 
     private var secondaryControls: some View {
         HStack {
-            // Shuffle
             Button(action: vm.toggleShuffle) {
                 VStack(spacing: 5) {
                     Image(systemName: "shuffle")
@@ -227,7 +238,6 @@ struct PlayerView: View {
 
             Spacer()
 
-            // Repeat
             Button(action: vm.toggleRepeat) {
                 VStack(spacing: 5) {
                     Image(systemName: vm.repeatMode.systemImage)
@@ -239,6 +249,116 @@ struct PlayerView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Extra Controls (Speed + Crossfade + Sleep Timer)
+
+    private var extraControls: some View {
+        HStack(spacing: 0) {
+
+            // Speed button
+            Button(action: vm.cycleSpeed) {
+                VStack(spacing: 4) {
+                    Image(systemName: "gauge.with.dots.needle.67percent")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.white.opacity(0.7))
+                    Text(vm.speedLabel)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .monospacedDigit()
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            // Crossfade toggle
+            Button {
+                vm.isCrossfadeEnabled.toggle()
+            } label: {
+                VStack(spacing: 4) {
+                    Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
+                        .font(.system(size: 16))
+                        .foregroundStyle(vm.isCrossfadeEnabled ? .white : .white.opacity(0.35))
+                    Text("Crossfade")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(vm.isCrossfadeEnabled ? .white.opacity(0.8) : .white.opacity(0.35))
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            // Sleep timer
+            Button {
+                showSleepSheet = true
+            } label: {
+                VStack(spacing: 4) {
+                    Image(systemName: "moon.zzz")
+                        .font(.system(size: 16))
+                        .foregroundStyle(vm.sleepTimerActive ? .white : .white.opacity(0.35))
+                    Text(vm.sleepTimerActive ? vm.sleepTimerLabel : "Sleep")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(vm.sleepTimerActive ? .white.opacity(0.8) : .white.opacity(0.35))
+                        .monospacedDigit()
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .background(.white.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    // MARK: - Sleep Timer Sheet
+
+    private var sleepTimerSheet: some View {
+        NavigationStack {
+            List {
+                if vm.sleepTimerActive {
+                    Section {
+                        HStack {
+                            Label("Tiempo restante", systemImage: "moon.zzz.fill")
+                                .foregroundStyle(.blue)
+                            Spacer()
+                            Text(vm.sleepTimerLabel)
+                                .font(.body.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Button(role: .destructive) {
+                            vm.cancelSleepTimer()
+                            showSleepSheet = false
+                        } label: {
+                            Label("Cancelar temporizador", systemImage: "xmark.circle")
+                        }
+                    }
+                }
+
+                Section("Apagar en…") {
+                    ForEach([5, 10, 15, 20, 30, 45, 60, 90], id: \.self) { minutes in
+                        Button {
+                            vm.setSleepTimer(minutes: minutes)
+                            showSleepSheet = false
+                        } label: {
+                            HStack {
+                                Text(minutes < 60
+                                     ? "\(minutes) minutos"
+                                     : minutes == 60 ? "1 hora" : "1h 30min")
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Image(systemName: "moon.zzz")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Temporizador de sueño")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Cerrar") { showSleepSheet = false }
+                }
+            }
+        }
+        .presentationDetents([.medium])
     }
 
     // MARK: - Helpers
