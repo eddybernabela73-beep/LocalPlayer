@@ -20,6 +20,11 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Generate app icon
+        run: |
+          pip3 install Pillow --quiet
+          python3 generate_icon.py
+
       - name: Generate Xcode project
         run: xcodegen generate
 

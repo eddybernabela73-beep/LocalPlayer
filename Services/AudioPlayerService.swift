@@ -200,7 +200,7 @@ final class AudioPlayerService {
         do { try file.read(into: buf) } catch { return }
 
         if buf.frameLength == 0 {
-            // Reached end of file
+            // Reached end of file — update state on main thread
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.generation == gen else { return }
                 self.isPlaying = false
@@ -211,9 +211,13 @@ final class AudioPlayerService {
         }
 
         playerNode.scheduleBuffer(buf, completionCallbackType: .dataConsumed) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.pumpBuffer(file: file, gen: gen)
-            }
+            // ⚠️  Do NOT dispatch to main here.
+            // When the app is in background the main queue is throttled and
+            // can stall for seconds, starving the audio pipeline and cutting
+            // the sound.  The audio-engine completion thread keeps running in
+            // background even when main is sleeping, so pump the next buffer
+            // directly from here.
+            self?.pumpBuffer(file: file, gen: gen)
         }
     }
 
